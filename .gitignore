@@ -5,3 +5,4 @@ database/patch_agent.db
 logs/
 reports/
 .env
+run_agent.bat
