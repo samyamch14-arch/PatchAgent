@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+database/patch_agent.db
+logs/
+reports/
+.env
