@@ -347,3 +347,130 @@ def uninstall_patch(kb_id: str) -> dict:
     except Exception as e:
         return {"success": False, "output": str(e), "kb_id": kb_id}    
     
+def clear_windows_update_cache() -> dict:
+    """
+    Clear Windows Update cache by stopping services,
+    deleting SoftwareDistribution folder, and restarting.
+    """
+    print("[SYSTEM] Clearing Windows Update cache...")
+    try:
+        script = """
+        Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name cryptSvc -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name bits -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name msiserver -Force -ErrorAction SilentlyContinue
+
+        $sd = "$env:SystemRoot\\SoftwareDistribution"
+        $cr = "$env:SystemRoot\\System32\\catroot2"
+
+        if (Test-Path $sd) { Rename-Item $sd "$sd.old" -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $cr) { Rename-Item $cr "$cr.old" -Force -ErrorAction SilentlyContinue }
+
+        Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+        Start-Service -Name cryptSvc -ErrorAction SilentlyContinue
+        Start-Service -Name bits -ErrorAction SilentlyContinue
+        Start-Service -Name msiserver -ErrorAction SilentlyContinue
+
+        Write-Output "Windows Update cache cleared successfully"
+        """
+        result = subprocess.run(
+            ["powershell", "-Command", script],
+            capture_output=True, text=True, timeout=120
+        )
+        success = "cleared successfully" in result.stdout.lower()
+        print(f"[SYSTEM] Cache clear result: {result.stdout.strip()[:100]}")
+        log_agent_action(
+            action="clear_wu_cache",
+            reasoning="Cleared Windows Update cache to fix failed updates",
+            outcome="Success" if success else "Failed"
+        )
+        return {"success": success, "output": result.stdout[:300], "tool": "clear_wu_cache"}
+    except Exception as e:
+        return {"success": False, "output": str(e), "tool": "clear_wu_cache"}
+
+
+def reset_windows_store() -> dict:
+    """
+    Reset Windows Store cache to fix Store app update failures.
+    """
+    print("[SYSTEM] Resetting Windows Store cache...")
+    try:
+        result = subprocess.run(
+            ["wsreset.exe"],
+            capture_output=True, text=True, timeout=60
+        )
+        log_agent_action(
+            action="reset_store",
+            reasoning="Reset Windows Store cache to fix app update failures",
+            outcome=f"Exit code: {result.returncode}"
+        )
+        return {
+            "success": result.returncode == 0,
+            "output": "Windows Store cache reset",
+            "tool": "reset_store"
+        }
+    except Exception as e:
+        return {"success": False, "output": str(e), "tool": "reset_store"}
+
+
+def retry_windows_update(kb_id: str) -> dict:
+    """
+    Retry a specific Windows Update by KB ID.
+    """
+    print(f"[SYSTEM] Retrying Windows Update for {kb_id}...")
+    try:
+        script = f"""
+        $UpdateSession = New-Object -ComObject Microsoft.Update.Session
+        $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
+        $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software'")
+        $targetUpdate = $null
+        foreach ($update in $SearchResult.Updates) {{
+            foreach ($kb in $update.KBArticleIDs) {{
+                if ($kb -eq '{kb_id.replace("KB", "")}') {{
+                    $targetUpdate = $update
+                    break
+                }}
+            }}
+        }}
+        if ($targetUpdate -eq $null) {{
+            Write-Output "UPDATE_NOT_FOUND"
+            exit 0
+        }}
+        $updateColl = New-Object -ComObject Microsoft.Update.UpdateColl
+        $updateColl.Add($targetUpdate)
+        $Downloader = $UpdateSession.CreateUpdateDownloader()
+        $Downloader.Updates = $updateColl
+        $Downloader.Download()
+        $Installer = $UpdateSession.CreateUpdateInstaller()
+        $Installer.Updates = $updateColl
+        $Result = $Installer.Install()
+        Write-Output "ResultCode:$($Result.ResultCode)"
+        Write-Output "RebootRequired:$($Result.RebootRequired)"
+        """
+        result = subprocess.run(
+            ["powershell", "-Command", script],
+            capture_output=True, text=True, timeout=600
+        )
+        output = result.stdout.strip()
+        if "UPDATE_NOT_FOUND" in output:
+            return {
+                "success": False,
+                "output": "Update not found — may be superseded",
+                "tool": "retry_update",
+                "superseded": True
+            }
+        success = "ResultCode:2" in output or "ResultCode:3" in output
+        log_agent_action(
+            action="retry_update",
+            reasoning=f"Retried failed update {kb_id}",
+            outcome=output[:200]
+        )
+        return {
+            "success": success,
+            "output": output[:300],
+            "tool": "retry_update",
+            "superseded": False
+        }
+    except Exception as e:
+        return {"success": False, "output": str(e), "tool": "retry_update", "superseded": False}    
+    

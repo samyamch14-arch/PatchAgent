@@ -418,11 +418,13 @@ def classify_patch_safety(kb_id: str, title: str, bug_description: str, installe
     }    
 
 
-def generate_patch_report(patches: list, issues: list, fixes: list, audit_results: list = None, update_history: list = None) -> str:
+def generate_patch_report(patches: list, issues: list, fixes: list, audit_results: list = None, update_history: list = None, failed_update_results: list = None) -> str:
     if audit_results is None:
         audit_results = []
     if update_history is None:
         update_history = []
+    if failed_update_results is None:
+        failed_update_results = []
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = os.path.join(REPORTS_DIR, f"report_{timestamp}.html")
@@ -606,6 +608,34 @@ def generate_patch_report(patches: list, issues: list, fixes: list, audit_result
             "<td class='" + result_class + "'>" + result_text + "</td>"
             "</tr>"
         )
+        
+    # ── failed remediation rows ──
+    failed_remediation_rows = ""
+    for r in failed_update_results:
+        action = r.get("action_taken", "none")
+        success = r.get("success", False)
+        if action in ["skipped", "superseded"]:
+            action_class = "warn"
+            action_text = "Skipped — superseded or already installed"
+        elif success:
+            action_class = "good"
+            action_text = "Fixed automatically"
+        elif action == "manual_required" or action == "retry_failed":
+            action_class = "bad"
+            action_text = "Manual required"
+        else:
+            action_class = "bad"
+            action_text = "Failed"
+        failed_remediation_rows += (
+            "<tr>"
+            "<td>" + safe_str(r.get("kb_id", "")) + "</td>"
+            "<td>" + safe_str(r.get("title", ""), 80) + "</td>"
+            "<td class='bad'>" + safe_str(r.get("error_code", "")) + "</td>"
+            "<td>" + safe_str(r.get("failure_reason", ""), 100) + "</td>"
+            "<td class='" + action_class + "'>" + action_text + "</td>"
+            "<td>" + safe_str(r.get("action_result", ""), 150) + "</td>"
+            "</tr>"
+        )    
 
     # ── history rows ──
     history_failed = [h for h in update_history if h.get("ResultCode") == 4 or h.get("Status") == "Failed"]
@@ -691,6 +721,15 @@ tr:nth-child(even) td{background:#f8fafc}
 ) + """
 
 <hr class="section-divider">
+<h2>Failed Update Remediation (Last 90 Days)</h2>
+<p class="section-note">Agent attempted to fix recent Windows Update failures. Superseded patches are safely skipped.</p>
+""" + (
+    "<p class='empty'>No recent failed updates found in the last 90 days.</p>" if not failed_update_results else
+    "<table><tr><th>KB ID</th><th>Title</th><th>Error Code</th><th>Failure Reason</th><th>Result</th><th>Action Taken</th></tr>" +
+    failed_remediation_rows + "</table>"
+) + """
+
+<hr class="section-divider">
 <h2>Windows Update Failed History</h2>
 <p class="section-note">All updates that failed to install — including error codes and failure reasons.</p>
 """ + (
@@ -769,6 +808,14 @@ tr:nth-child(even) td{background:#f8fafc}
         f.write(html)
 
     print(f"[PATCH] Report written to {report_path}")
+    return report_path
+
+
+def generate_audit_report(audit_results: list) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = os.path.join(REPORTS_DIR, f"audit_{timestamp}.html")
+    with open(report_path, "w") as f:
+        f.write("<html><body><p>Audit complete — see main report for full details.</p></body></html>")
     return report_path
 
 
