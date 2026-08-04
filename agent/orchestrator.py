@@ -1,29 +1,6 @@
 import time
 from datetime import datetime
 from config.settings import MAX_REMEDIATION_ATTEMPTS, AUTO_INSTALL_RISK_LEVELS
-from tools.patch_tools import (
-    get_pending_updates,
-    get_installed_patches,
-    get_known_issues,
-    install_pending_updates,
-    generate_patch_report,
-    get_installed_patch_registry,
-    check_patch_against_bug_db,
-    generate_audit_report,
-    get_windows_update_history,
-    classify_patch_safety
-)
-from tools.patch_tools import (
-    get_pending_updates,
-    get_installed_patches,
-    get_known_issues,
-    install_pending_updates,
-    generate_patch_report,
-    get_installed_patch_registry,
-    check_patch_against_bug_db,
-    generate_audit_report,
-    get_windows_update_history
-)
 from database.db import (
     log_agent_action,
     save_patch,
@@ -39,13 +16,18 @@ from tools.patch_tools import (
     generate_patch_report,
     get_installed_patch_registry,
     check_patch_against_bug_db,
-    generate_audit_report
+    generate_audit_report,
+    get_windows_update_history,
+    classify_patch_safety
 )
 from tools.system_tools import (
     get_event_logs,
     save_events_to_db,
     execute_fix,
-    uninstall_patch
+    uninstall_patch,
+    clear_windows_update_cache,
+    reset_windows_store,
+    retry_windows_update
 )
 
 
