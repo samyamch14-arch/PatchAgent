@@ -10,6 +10,18 @@ from tools.patch_tools import (
     get_installed_patch_registry,
     check_patch_against_bug_db,
     generate_audit_report,
+    get_windows_update_history,
+    classify_patch_safety
+)
+from tools.patch_tools import (
+    get_pending_updates,
+    get_installed_patches,
+    get_known_issues,
+    install_pending_updates,
+    generate_patch_report,
+    get_installed_patch_registry,
+    check_patch_against_bug_db,
+    generate_audit_report,
     get_windows_update_history
 )
 from database.db import (
@@ -39,11 +51,14 @@ from tools.system_tools import (
 
 def run_historical_audit():
     """
-    Phase 6 — Audit all installed patches against known bug databases.
-    If bugs found: attempt root cause fix first.
-    If fix fails after 3 attempts: uninstall the patch automatically.
+    Phase 1 — Audit all installed patches against known bug databases.
+    Classifies each buggy patch before acting:
+    - Superseded by newer patch → skip silently
+    - Security patch → safe fixes only, never uninstall
+    - Major impact bug → report only, do not touch
+    - Non-security resolvable bug → full remediation
     """
-    print("\n[ORCHESTRATOR] ── Phase 6: Historical Patch Audit ──")
+    print("\n[ORCHESTRATOR] ── Phase 1: Historical Patch Audit ──")
     log_agent_action(action="historical_audit_start", reasoning="Auditing all installed patches")
 
     installed = get_installed_patch_registry()
@@ -60,100 +75,191 @@ def run_historical_audit():
 
     for patch in installed:
         kb_id = patch["kb_id"]
+        title = patch.get("description", "")
         result = check_patch_against_bug_db(kb_id)
         result["description"] = patch.get("description", "")
         result["installed_on"] = patch.get("installed_on", "")
         result["action_taken"] = "none"
         result["action_result"] = ""
 
-        if result["has_issues"]:
-            flagged_count += 1
-            print(f"\n[ORCHESTRATOR] Bug found in installed patch {kb_id}")
-            print(f"[ORCHESTRATOR] Bug: {result['issues'][:100]}")
+        if not result["has_issues"]:
+            print(f"[ORCHESTRATOR] ✓ {kb_id} — clean")
+            audit_results.append(result)
+            continue
 
-            from database.db import save_patch_bug
-            save_patch_bug(
-                kb_id=kb_id,
-                bug_description=result["issues"],
-                severity="Medium"
+        flagged_count += 1
+        print(f"\n[ORCHESTRATOR] Bug found in {kb_id}: {result['issues'][:80]}")
+
+        from database.db import save_patch_bug
+        save_patch_bug(
+            kb_id=kb_id,
+            bug_description=result["issues"],
+            severity="Medium"
+        )
+
+        # Classify the patch before doing anything
+        classification = classify_patch_safety(
+            kb_id=kb_id,
+            title=title,
+            bug_description=result["issues"],
+            installed_patches=installed
+        )
+
+        action_level = classification["action_level"]
+        reason = classification["reason"]
+
+        print(f"[ORCHESTRATOR] Classification: {action_level} — {reason}")
+
+        result["classification"] = classification
+        result["action_level"] = action_level
+
+        # SKIP — superseded by newer patch, bug already resolved
+        if action_level == "skip":
+            print(f"[ORCHESTRATOR] Skipping {kb_id} — {reason}")
+            result["action_taken"] = "skipped_superseded"
+            result["action_result"] = reason
+            audit_results.append(result)
+            log_agent_action(
+                action="patch_audit_skipped",
+                reasoning=f"{kb_id} superseded",
+                outcome=reason
             )
+            continue
 
-            print(f"[ORCHESTRATOR] Running root cause analysis for {kb_id}...")
+        # REPORT ONLY — major impact bug, too risky to touch
+        if action_level == "report_only":
+            print(f"[ORCHESTRATOR] Reporting only for {kb_id} — too risky to touch")
+            result["action_taken"] = "reported_only"
+            result["action_result"] = (
+                f"Bug detected but not touched automatically — {reason}. "
+                f"Manual investigation recommended."
+            )
+            audit_results.append(result)
+            log_agent_action(
+                action="patch_audit_report_only",
+                reasoning=f"{kb_id} major impact",
+                outcome=reason
+            )
+            continue
+
+        # SAFE FIX ONLY — security patch, only DISM and service restart allowed
+        if action_level == "safe_fix_only":
+            print(f"[ORCHESTRATOR] Safe fix only for {kb_id} — {reason}")
+
             rca = analyze_root_cause(kb_id, result["issues"], is_installed=True)
-
-            print(f"[ORCHESTRATOR] Root cause: {rca.get('root_cause', '')}")
-            print(f"[ORCHESTRATOR] Severity: {rca.get('severity')} | Can auto fix: {rca.get('can_auto_fix')} | Recommendation: {rca.get('recommendation')}")
-
-            result["root_cause"] = rca.get("root_cause", "")
-            result["severity"] = rca.get("severity", "Medium")
-            result["recommendation"] = rca.get("recommendation", "monitor")
-            result["manual_instructions"] = rca.get("manual_instructions", "")
-
-            recommendation = rca.get("recommendation", "monitor")
-            can_auto_fix = rca.get("can_auto_fix", "no")
             fix_tool = rca.get("fix_tool", "manual_only")
 
+            # Force to safe tools only — never rollback or registry on security patches
+            if fix_tool in ["rollback_patch", "registry_fix"]:
+                fix_tool = "dism_restore"
+
+            if fix_tool == "manual_only":
+                print(f"[ORCHESTRATOR] No safe automated fix available for security patch {kb_id}")
+                result["action_taken"] = "security_patch_reported"
+                result["action_result"] = (
+                    f"Security patch with bug — cannot auto-fix safely. "
+                    f"Root cause: {rca.get('root_cause', '')}. "
+                    f"Manual action: {rca.get('manual_instructions', '')[:200]}"
+                )
+                audit_results.append(result)
+                continue
+
+            # Attempt safe fix
+            fix_succeeded = False
+            attempt = 0
+            while attempt < MAX_REMEDIATION_ATTEMPTS and not fix_succeeded:
+                attempt += 1
+                print(f"[ORCHESTRATOR] Safe fix attempt {attempt}/{MAX_REMEDIATION_ATTEMPTS} using {fix_tool}")
+                fix_result = execute_fix(fix_tool, "safe")
+                fix_succeeded = fix_result.get("success", False)
+                if not fix_succeeded:
+                    time.sleep(5)
+
+            if fix_succeeded:
+                print(f"[ORCHESTRATOR] Safe fix succeeded for security patch {kb_id}")
+                result["action_taken"] = f"safe_fixed_with_{fix_tool}"
+                result["action_result"] = "Safe fix applied — security patch retained"
+                log_agent_action(
+                    action="security_patch_fixed",
+                    reasoning=f"Safe fix applied to security patch {kb_id}",
+                    outcome="Success"
+                )
+            else:
+                print(f"[ORCHESTRATOR] Safe fix failed for security patch {kb_id} — reporting to user")
+                result["action_taken"] = "security_patch_fix_failed"
+                result["action_result"] = (
+                    f"Attempted {fix_tool} — failed. Security patch retained. "
+                    f"Manual review recommended: {rca.get('manual_instructions', '')[:150]}"
+                )
+                log_agent_action(
+                    action="security_patch_fix_failed",
+                    reasoning=f"Could not safely fix {kb_id}",
+                    outcome="Reported to user"
+                )
+
+            audit_results.append(result)
+            continue
+
+        # FULL REMEDIATION — non-security, non-superseded, low-risk bug
+        if action_level == "full_remediation":
+            print(f"[ORCHESTRATOR] Full remediation for {kb_id}")
+
+            rca = analyze_root_cause(kb_id, result["issues"], is_installed=True)
+            fix_tool = rca.get("fix_tool", "manual_only")
             fix_succeeded = False
 
-            if can_auto_fix == "yes" and fix_tool != "manual_only":
-                print(f"[ORCHESTRATOR] Attempting automatic fix for {kb_id} using {fix_tool}...")
+            if fix_tool != "manual_only":
                 attempt = 0
-
                 while attempt < MAX_REMEDIATION_ATTEMPTS and not fix_succeeded:
                     attempt += 1
-                    print(f"[ORCHESTRATOR] Fix attempt {attempt}/{MAX_REMEDIATION_ATTEMPTS}")
+                    print(f"[ORCHESTRATOR] Fix attempt {attempt}/{MAX_REMEDIATION_ATTEMPTS} using {fix_tool}")
                     fix_result = execute_fix(fix_tool, "safe")
                     fix_succeeded = fix_result.get("success", False)
-
-                    if fix_succeeded:
-                        print(f"[ORCHESTRATOR] Fix succeeded on attempt {attempt} — keeping patch {kb_id}")
-                        result["action_taken"] = f"fixed_with_{fix_tool}"
-                        result["action_result"] = "Fix successful — patch retained"
-                        log_agent_action(
-                            action="patch_bug_fixed",
-                            reasoning=f"Fixed bug in {kb_id} using {fix_tool}",
-                            outcome="Success — patch retained"
-                        )
-                    else:
-                        print(f"[ORCHESTRATOR] Fix attempt {attempt} failed...")
+                    if not fix_succeeded:
                         time.sleep(5)
 
-            if not fix_succeeded:
-                if recommendation in ["uninstall", "fix_then_keep"]:
-                    print(f"[ORCHESTRATOR] Fix failed — uninstalling {kb_id}...")
-                    uninstall_result = uninstall_patch(kb_id)
+            if fix_succeeded:
+                print(f"[ORCHESTRATOR] Fix succeeded — keeping patch {kb_id}")
+                result["action_taken"] = f"fixed_with_{fix_tool}"
+                result["action_result"] = "Bug fixed automatically — patch retained"
+                log_agent_action(
+                    action="patch_bug_fixed",
+                    reasoning=f"Fixed {kb_id} using {fix_tool}",
+                    outcome="Success"
+                )
+                audit_results.append(result)
+                continue
 
-                    if uninstall_result["success"]:
-                        print(f"[ORCHESTRATOR] Successfully uninstalled {kb_id}")
-                        result["action_taken"] = "uninstalled"
-                        result["action_result"] = f"Patch uninstalled due to bug: {result['issues'][:100]}"
-                        log_agent_action(
-                            action="patch_uninstalled",
-                            reasoning=f"Uninstalled {kb_id} — bug could not be fixed",
-                            outcome="Success"
-                        )
-                    else:
-                        print(f"[ORCHESTRATOR] Could not uninstall {kb_id} — providing manual instructions")
-                        result["action_taken"] = "uninstall_failed"
-                        result["action_result"] = "Automatic uninstall failed — see manual instructions below"
-                        log_agent_action(
-                            action="patch_uninstall_failed",
-                            reasoning=f"Could not uninstall {kb_id}",
-                            outcome=uninstall_result.get("output", "")
-                        )
-                else:
-                    print(f"[ORCHESTRATOR] Monitoring {kb_id} — no action taken")
-                    result["action_taken"] = "manual_required"
-                    result["action_result"] = rca.get("manual_instructions", "Manual investigation required")
+            # Fix failed — attempt uninstall as last resort
+            print(f"[ORCHESTRATOR] Fix failed — attempting uninstall of {kb_id}")
+            uninstall_result = uninstall_patch(kb_id)
 
-        else:
-            print(f"[ORCHESTRATOR] ✓ {kb_id} — clean")
+            if uninstall_result["success"]:
+                print(f"[ORCHESTRATOR] Successfully uninstalled {kb_id}")
+                result["action_taken"] = "uninstalled"
+                result["action_result"] = f"Patch uninstalled — bug: {result['issues'][:100]}"
+                log_agent_action(
+                    action="patch_uninstalled",
+                    reasoning=f"Uninstalled buggy non-security patch {kb_id}",
+                    outcome="Success"
+                )
+            else:
+                print(f"[ORCHESTRATOR] Uninstall failed — reporting {kb_id} to user")
+                result["action_taken"] = "uninstall_failed"
+                result["action_result"] = (
+                    f"Could not fix or uninstall automatically. "
+                    f"Manual action required: {rca.get('manual_instructions', '')[:200]}"
+                )
+                log_agent_action(
+                    action="patch_uninstall_failed",
+                    reasoning=f"Could not remediate {kb_id}",
+                    outcome="Escalated to user"
+                )
 
-        audit_results.append(result)
+            audit_results.append(result)
 
     report_path = generate_audit_report(audit_results)
     print(f"\n[ORCHESTRATOR] Audit complete — {flagged_count} patches flagged out of {len(installed)}")
-    print(f"[ORCHESTRATOR] Audit report: {report_path}")
 
     log_agent_action(
         action="historical_audit_complete",
@@ -557,6 +663,160 @@ def run_remediation(events: list) -> list:
 
     return fix_results
 
+def run_failed_update_remediation():
+    """
+    Phase 2 — Remediate failed Windows Update history entries.
+    Only processes failures from the last 90 days.
+    Skips superseded patches, fixes root causes, retries where safe.
+    """
+    print("\n[ORCHESTRATOR] ── Phase 2: Failed Update Remediation ──")
+    log_agent_action(action="failed_update_remediation_start", reasoning="Processing failed Windows Update history")
+
+    from tools.patch_tools import get_windows_update_history
+    from datetime import timedelta
+
+    history = get_windows_update_history()
+    cutoff = datetime.now() - timedelta(days=90)
+
+    recent_failures = []
+    for h in history:
+        if h.get("Status") != "Failed" and h.get("ResultCode") != 4:
+            continue
+        try:
+            entry_date = datetime.strptime(h.get("Date", "")[:19], "%Y-%m-%d %H:%M:%S")
+            if entry_date >= cutoff:
+                recent_failures.append(h)
+        except Exception:
+            continue
+
+    if not recent_failures:
+        print("[ORCHESTRATOR] No recent failed updates found (last 90 days)")
+        log_agent_action(action="failed_update_remediation_complete", outcome="No recent failures found")
+        run_agent_cycle._last_failed_updates = []
+        return []
+
+    seen_kb = set()
+    unique_failures = []
+    for h in recent_failures:
+        kb = h.get("KBArticle", "N/A")
+        if kb not in seen_kb:
+            seen_kb.add(kb)
+            unique_failures.append(h)
+
+    print(f"[ORCHESTRATOR] Found {len(unique_failures)} unique recent failed updates to process")
+
+    remediation_results = []
+
+    for entry in unique_failures:
+        kb_id = entry.get("KBArticle", "N/A")
+        title = entry.get("Title", "")[:80]
+        error_code = entry.get("ErrorCode", "")
+        failure_reason = entry.get("FailureReason", "")
+        is_store_app = kb_id == "N/A"
+
+        print(f"\n[ORCHESTRATOR] Processing failed update: {kb_id} — {title[:50]}")
+        print(f"[ORCHESTRATOR] Error: {error_code} — {failure_reason}")
+
+        result_entry = {
+            "kb_id": kb_id,
+            "title": title,
+            "error_code": error_code,
+            "failure_reason": failure_reason,
+            "action_taken": "none",
+            "action_result": "",
+            "success": False
+        }
+
+        # Already installed or superseded — skip safely
+        if error_code in ["0x80240016", "0x80240022", "0x80240020"]:
+            print(f"[ORCHESTRATOR] {kb_id} already installed or superseded — skipping")
+            result_entry["action_taken"] = "skipped"
+            result_entry["action_result"] = "Update already installed or superseded — no action needed"
+            result_entry["success"] = True
+            remediation_results.append(result_entry)
+            continue
+
+        # Windows Store app failure — reset store cache
+        if is_store_app:
+            print(f"[ORCHESTRATOR] Store app failure — resetting Windows Store cache")
+            store_result = reset_windows_store()
+            result_entry["action_taken"] = "reset_store"
+            result_entry["action_result"] = store_result.get("output", "")
+            result_entry["success"] = store_result.get("success", False)
+            remediation_results.append(result_entry)
+            continue
+
+        # Deployment crash — clear cache and retry
+        if error_code in ["0x80240034", "0x80073712", "0x800705B4"]:
+            print(f"[ORCHESTRATOR] Deployment crash — clearing update cache")
+
+            restore = create_restore_point(f"PatchAgent_before_retry_{kb_id}")
+            if not restore["success"]:
+                print(f"[ORCHESTRATOR] Could not create restore point — skipping {kb_id}")
+                result_entry["action_taken"] = "skipped"
+                result_entry["action_result"] = "Restore point failed — skipped for safety"
+                remediation_results.append(result_entry)
+                continue
+
+            cache_result = clear_windows_update_cache()
+            if not cache_result["success"]:
+                print(f"[ORCHESTRATOR] Cache clear failed — skipping retry for {kb_id}")
+                result_entry["action_taken"] = "cache_clear_failed"
+                result_entry["action_result"] = cache_result.get("output", "")
+                remediation_results.append(result_entry)
+                continue
+
+            print(f"[ORCHESTRATOR] Cache cleared — retrying {kb_id}")
+            retry_result = retry_windows_update(kb_id)
+
+            if retry_result.get("superseded"):
+                print(f"[ORCHESTRATOR] {kb_id} is superseded — no longer needed")
+                result_entry["action_taken"] = "superseded"
+                result_entry["action_result"] = "Update superseded by newer patch — no action needed"
+                result_entry["success"] = True
+            elif retry_result.get("success"):
+                print(f"[ORCHESTRATOR] Successfully installed {kb_id} on retry")
+                result_entry["action_taken"] = "retried_and_installed"
+                result_entry["action_result"] = f"Fixed — cleared cache and successfully installed {kb_id}"
+                result_entry["success"] = True
+                log_agent_action(
+                    action="failed_update_fixed",
+                    reasoning=f"Cleared cache and retried {kb_id}",
+                    outcome="Success"
+                )
+            else:
+                print(f"[ORCHESTRATOR] Retry failed for {kb_id} — escalating to user")
+                result_entry["action_taken"] = "retry_failed"
+                result_entry["action_result"] = (
+                    f"Attempted cache clear and retry — still failing with {error_code}. "
+                    f"Manual fix: open Windows Update settings and try installing manually, "
+                    f"or run sfc /scannow in an elevated command prompt."
+                )
+                result_entry["success"] = False
+
+            remediation_results.append(result_entry)
+            continue
+
+        # Unknown error code — log for manual review
+        print(f"[ORCHESTRATOR] Unknown error code {error_code} — logging for manual review")
+        result_entry["action_taken"] = "manual_required"
+        result_entry["action_result"] = (
+            f"Error {error_code} requires manual investigation. "
+            f"Check C:\\Windows\\Logs\\WindowsUpdate\\ for details."
+        )
+        remediation_results.append(result_entry)
+
+    fixed = len([r for r in remediation_results if r.get("success")])
+    print(f"\n[ORCHESTRATOR] Failed update remediation complete — {fixed}/{len(unique_failures)} resolved")
+
+    log_agent_action(
+        action="failed_update_remediation_complete",
+        outcome=f"Processed {len(unique_failures)} failures, resolved {fixed}"
+    )
+
+    run_agent_cycle._last_failed_updates = remediation_results
+    return remediation_results
+
 
 def run_agent_cycle():
     """
@@ -571,8 +831,11 @@ def run_agent_cycle():
     log_agent_action(action="cycle_start", reasoning="Scheduled agent cycle began")
 
     try:
-        # Phase 6 — Historical audit
+        # Phase 1 — Historical audit
         run_historical_audit()
+
+        # Phase 2 — Failed update remediation (last 90 days)
+        failed_update_results = run_failed_update_remediation()
 
         # Step 1 — Detect and assess patches
         assessed_patches = run_patch_detection()
@@ -589,13 +852,15 @@ def run_agent_cycle():
         # Step 5 — Generate combined report
         all_patches = [dict(p) for p in get_all_patches()]
         audit_results = getattr(run_agent_cycle, "_last_audit", [])
+        failed_update_results = getattr(run_agent_cycle, "_last_failed_updates", [])
         update_history = get_windows_update_history()
         report_path = generate_patch_report(
             patches=all_patches,
             issues=events,
             fixes=fix_results,
             audit_results=audit_results,
-            update_history=update_history
+            update_history=update_history,
+            failed_update_results=failed_update_results
         )
 
         duration = int(time.time() - cycle_start)
@@ -610,6 +875,8 @@ def run_agent_cycle():
 
     except Exception as e:
         print(f"\n[ORCHESTRATOR] CRITICAL ERROR in agent cycle: {e}")
+        import traceback
+        print(traceback.format_exc())
         log_agent_action(
             action="cycle_error",
             outcome=f"Critical error: {e}"

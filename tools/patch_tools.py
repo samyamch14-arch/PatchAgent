@@ -326,6 +326,96 @@ def get_windows_update_history() -> list:
     except Exception as e:
         print(f"[PATCH] ERROR fetching update history: {e}")
         return []
+    
+def classify_patch_safety(kb_id: str, title: str, bug_description: str, installed_patches: list) -> dict:
+    """
+    Classify a buggy patch before deciding what action to take.
+    Returns a classification dict with safe action level.
+    """
+    title_lower = title.lower()
+    bug_lower = bug_description.lower()
+
+    # Check 1 — Is this a security patch?
+    security_keywords = [
+        "security", "defender", "intelligence update", "antivirus",
+        "antimalware", "cumulative update", "critical", "important"
+    ]
+    is_security = any(kw in title_lower for kw in security_keywords)
+
+    # Check 2 — Is the bug a security vulnerability?
+    vulnerability_keywords = [
+        "cve-", "vulnerability", "exploit", "remote code execution",
+        "privilege escalation", "zero day", "rce", "elevation of privilege"
+    ]
+    is_vulnerability = any(kw in bug_lower for kw in vulnerability_keywords)
+
+    # Check 3 — Is there a newer patch installed that supersedes this one?
+    # Compare KB numbers — higher KB number = newer patch for same component
+    kb_number = int(kb_id.replace("KB", "").replace("kb", "")) if kb_id.startswith("KB") else 0
+    is_superseded = False
+    superseded_by = ""
+
+    # Detect component family from title
+    component_keywords = []
+    if "windows 11" in title_lower:
+        component_keywords.append("windows 11")
+    if "windows 10" in title_lower:
+        component_keywords.append("windows 10")
+    if "defender" in title_lower or "antivirus" in title_lower:
+        component_keywords.append("defender")
+    if ".net" in title_lower:
+        component_keywords.append(".net")
+    if "office" in title_lower:
+        component_keywords.append("office")
+
+    for installed in installed_patches:
+        inst_kb = installed.get("kb_id", "")
+        inst_title = installed.get("title", installed.get("description", "")).lower()
+        inst_number = int(inst_kb.replace("KB", "").replace("kb", "")) if inst_kb.startswith("KB") else 0
+
+        # Skip if same patch
+        if inst_kb == kb_id:
+            continue
+
+        # If newer KB from same component family is installed — superseded
+        if inst_number > kb_number and component_keywords:
+            if any(kw in inst_title for kw in component_keywords):
+                is_superseded = True
+                superseded_by = inst_kb
+                break
+
+    # Check 4 — Does the bug description suggest major system impact?
+    major_impact_keywords = [
+        "boot failure", "blue screen", "bsod", "system crash",
+        "cannot start", "unbootable", "kernel panic", "data loss",
+        "corruption", "registry damage", "network failure"
+    ]
+    is_major_impact = any(kw in bug_lower for kw in major_impact_keywords)
+
+    # Determine action level
+    if is_superseded:
+        action_level = "skip"
+        reason = f"Bug resolved by newer installed patch {superseded_by}"
+    elif is_security or is_vulnerability:
+        action_level = "safe_fix_only"
+        reason = "Security patch — safe fixes only, never uninstall"
+    elif is_major_impact:
+        action_level = "report_only"
+        reason = "Bug causes major system impact — too risky to touch automatically"
+    else:
+        action_level = "full_remediation"
+        reason = "Non-security patch with resolvable bug — full remediation permitted"
+
+    return {
+        "kb_id": kb_id,
+        "is_security": is_security,
+        "is_vulnerability": is_vulnerability,
+        "is_superseded": is_superseded,
+        "superseded_by": superseded_by,
+        "is_major_impact": is_major_impact,
+        "action_level": action_level,
+        "reason": reason
+    }    
 
 
 def generate_patch_report(patches: list, issues: list, fixes: list, audit_results: list = None, update_history: list = None) -> str:
@@ -425,14 +515,31 @@ def generate_patch_report(patches: list, issues: list, fixes: list, audit_result
         action = safe_str(r.get("action_taken", "none"))
         root_cause = safe_str(r.get("root_cause", ""))
         manual_instructions = safe_str(r.get("manual_instructions", ""))
+        action_level = safe_str(r.get("action_level", ""))
 
         action_display = "—"
         action_class = ""
-        if "fixed" in action:
+
+        if action == "skipped_superseded":
+            action_display = "Skipped — resolved in newer patch"
+            action_class = "warn"
+        elif action == "reported_only":
+            action_display = "Reported only — too risky to touch"
+            action_class = "bad"
+        elif action == "security_patch_reported":
+            action_display = "Security patch — manual review needed"
+            action_class = "bad"
+        elif action == "security_patch_fix_failed":
+            action_display = "Security patch — safe fix failed"
+            action_class = "bad"
+        elif "safe_fixed" in action:
+            action_display = "Safe fix applied — security patch kept"
+            action_class = "good"
+        elif "fixed" in action:
             action_display = "Fixed automatically"
             action_class = "good"
         elif action == "uninstalled":
-            action_display = "Uninstalled"
+            action_display = "Uninstalled safely"
             action_class = "warn"
         elif action == "uninstall_failed":
             action_display = "Uninstall failed — manual needed"
@@ -442,7 +549,10 @@ def generate_patch_report(patches: list, issues: list, fixes: list, audit_result
             action_class = "bad"
 
         manual_row = ""
-        if manual_instructions and action in ["manual_required", "uninstall_failed"]:
+        if manual_instructions and action in [
+            "reported_only", "uninstall_failed",
+            "security_patch_reported", "security_patch_fix_failed"
+        ]:
             manual_row = (
                 "<tr style='background:#fff7ed'>"
                 "<td colspan='6' style='font-size:12px;color:#92400e;padding:8px 12px'>"
