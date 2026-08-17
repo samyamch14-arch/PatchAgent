@@ -7,6 +7,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config.settings import AGENT_INTERVAL_HOURS, LOG_FILE, LOG_LEVEL, LOGS_DIR, REPORTS_DIR
 from database.db import initialize_database, log_agent_action
 from agent.orchestrator import run_agent_cycle
+from agent.watcher import watcher
 
 
 def setup_logging():
@@ -77,6 +78,12 @@ def main():
     # Setup
     setup_logging()
     startup_check()
+    # Start real-time watcher in background
+    watcher.start()
+
+    # Run one immediate cycle on startup
+    print("[MAIN] Running initial cycle now...")
+    run_agent_cycle()
 
     # Run one immediate cycle on startup
     print("[MAIN] Running initial cycle now...")
