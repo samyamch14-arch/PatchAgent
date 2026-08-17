@@ -29,6 +29,19 @@ from tools.system_tools import (
     reset_windows_store,
     retry_windows_update
 )
+from agent.notifier import (
+    notify_cycle_started,
+    notify_cycle_complete,
+    notify_patch_installed,
+    notify_patch_held,
+    notify_bug_found,
+    notify_patch_uninstalled,
+    notify_error_fixed,
+    notify_error_escalated,
+    notify_failed_update_fixed,
+    notify_security_patch_warning,
+    notify_agent_error
+)
 
 
 def run_historical_audit():
@@ -71,6 +84,7 @@ def run_historical_audit():
 
         flagged_count += 1
         print(f"\n[ORCHESTRATOR] Bug found in {kb_id}: {result['issues'][:80]}")
+        notify_bug_found(kb_id, classification.get("severity", "Medium") if "classification" in result else "Medium")
 
         from database.db import save_patch_bug
         save_patch_bug(
@@ -218,6 +232,7 @@ def run_historical_audit():
 
             if uninstall_result["success"]:
                 print(f"[ORCHESTRATOR] Successfully uninstalled {kb_id}")
+                notify_patch_uninstalled(kb_id)
                 result["action_taken"] = "uninstalled"
                 result["action_result"] = f"Patch uninstalled — bug: {result['issues'][:100]}"
                 log_agent_action(
@@ -412,6 +427,7 @@ def run_patch_installation(assessed_patches: list) -> list:
 
         if risk == "High" or recommendation in ["hold", "skip_install"]:
             print(f"[ORCHESTRATOR] HOLDING patch {kb_id} — risk too high or bugs present")
+            notify_patch_held(kb_id, patch.get("reasoning", "High risk patch"))
             log_agent_action(
                 action="patch_held",
                 reasoning=f"Patch {kb_id} held — risk level: {risk}",
@@ -431,6 +447,7 @@ def run_patch_installation(assessed_patches: list) -> list:
 
             if result["success"]:
                 print(f"[ORCHESTRATOR] Patch {kb_id} installed successfully")
+                notify_patch_installed(kb_id, patch.get("title", ""))
                 patch["status"] = "installed"
                 installed.append(patch)
                 save_patch(
@@ -593,6 +610,7 @@ def run_remediation(events: list) -> list:
 
             if success:
                 print(f"[ORCHESTRATOR] Fix successful on attempt {attempt}")
+                notify_error_fixed(source, fix_tool, from_cache=cached is not None)
                 update_cache_success(source, fingerprint, succeeded=True)
                 break
             else:
@@ -622,6 +640,7 @@ def run_remediation(events: list) -> list:
                 )
             else:
                 print(f"[ORCHESTRATOR] All attempts failed — escalating to user")
+                notify_error_escalated(source, f"All {MAX_REMEDIATION_ATTEMPTS} attempts failed using {fix_tool}")
                 log_agent_action(
                     action="remediation_escalated",
                     reasoning=f"All fix attempts failed for {source}",
@@ -758,6 +777,7 @@ def run_failed_update_remediation():
                 result_entry["success"] = True
             elif retry_result.get("success"):
                 print(f"[ORCHESTRATOR] Successfully installed {kb_id} on retry")
+                notify_failed_update_fixed(kb_id)
                 result_entry["action_taken"] = "retried_and_installed"
                 result_entry["action_result"] = f"Fixed — cleared cache and successfully installed {kb_id}"
                 result_entry["success"] = True
@@ -811,6 +831,7 @@ def run_agent_cycle():
     print(f"{'='*60}")
 
     log_agent_action(action="cycle_start", reasoning="Scheduled agent cycle began")
+    notify_cycle_started()
 
     try:
         # Phase 1 — Historical audit
@@ -848,6 +869,12 @@ def run_agent_cycle():
         duration = int(time.time() - cycle_start)
         print(f"\n[ORCHESTRATOR] CYCLE COMPLETE in {duration}s")
         print(f"[ORCHESTRATOR] Report saved to: {report_path}")
+        
+        notify_cycle_complete(
+            installed=len([p for p in assessed_patches if p.get("status") == "installed"]),
+            fixed=len([f for f in fix_results if f.get("success")]),
+            duration=duration
+        )
 
         log_agent_action(
             action="cycle_complete",
@@ -857,6 +884,7 @@ def run_agent_cycle():
 
     except Exception as e:
         print(f"\n[ORCHESTRATOR] CRITICAL ERROR in agent cycle: {e}")
+        notify_agent_error(str(e))
         import traceback
         print(traceback.format_exc())
         log_agent_action(
